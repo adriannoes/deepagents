@@ -68,6 +68,10 @@ jobs:
           # NOT in that glob" — causing unrelated files (e.g. .github/
           # templates) to match every filter and trigger full CI.
           # See: https://github.com/dorny/paths-filter/issues/97
+          # Packages that editable-install the SDK (`deepagents = { path = ... }`)
+          # must include 'libs/deepagents/**' so an SDK change runs their tests
+          # too — otherwise a breaking SDK change merges green and only fails
+          # on main, where every job runs unconditionally.
           filters: |
             deepagents:
               - 'libs/deepagents/**'
@@ -84,6 +88,7 @@ jobs:
               - '.github/actions/**'
             code:
               - 'libs/code/**'
+              - 'libs/deepagents/**'
               - '.github/workflows/ci.yml'
               - '.github/workflows/_lint.yml'
               - '.github/workflows/_test.yml'
@@ -98,6 +103,7 @@ jobs:
               - '.github/actions/**'
             evals:
               - 'libs/evals/**'
+              - 'libs/deepagents/**'
               # The evals test suite asserts on its own workflow files (e.g.
               # test_harbor_langsmith_integration.py reads harbor.yml and
               # _eval.yml), so editing any eval workflow must run the evals
@@ -122,30 +128,35 @@ jobs:
               - '.github/actions/**'
             daytona:
               - 'libs/partners/daytona/**'
+              - 'libs/deepagents/**'
               - '.github/workflows/ci.yml'
               - '.github/workflows/_lint.yml'
               - '.github/workflows/_test.yml'
               - '.github/actions/**'
             modal:
               - 'libs/partners/modal/**'
+              - 'libs/deepagents/**'
               - '.github/workflows/ci.yml'
               - '.github/workflows/_lint.yml'
               - '.github/workflows/_test.yml'
               - '.github/actions/**'
             runloop:
               - 'libs/partners/runloop/**'
+              - 'libs/deepagents/**'
               - '.github/workflows/ci.yml'
               - '.github/workflows/_lint.yml'
               - '.github/workflows/_test.yml'
               - '.github/actions/**'
             vercel:
               - 'libs/partners/vercel/**'
+              - 'libs/deepagents/**'
               - '.github/workflows/ci.yml'
               - '.github/workflows/_lint.yml'
               - '.github/workflows/_test.yml'
               - '.github/actions/**'
             quickjs:
               - 'libs/partners/quickjs/**'
+              - 'libs/deepagents/**'
               - '.github/workflows/ci.yml'
               - '.github/workflows/_lint.yml'
               - '.github/workflows/_test.yml'
@@ -176,7 +187,7 @@ jobs:
     uses: ./.github/workflows/_lint.yml
     with:
       working-directory: "libs/code"
-      python-version: "3.11"
+      python-version: "3.12"
 
   lint-talon:
     name: "🧹 Lint talon"
@@ -185,7 +196,7 @@ jobs:
     uses: ./.github/workflows/_lint.yml
     with:
       working-directory: "libs/talon"
-      python-version: "3.11"
+      python-version: "3.12"
 
   lint-evals:
     name: "🧹 Lint evals"
@@ -279,7 +290,7 @@ jobs:
     uses: ./.github/workflows/_test.yml
     with:
       working-directory: "libs/code"
-      python-versions: '["3.11", "3.12", "3.13", "3.14"]'
+      python-versions: '["3.12", "3.13", "3.14"]'
       coverage-python-version: "3.14"
 
   test-talon:
@@ -289,7 +300,7 @@ jobs:
     uses: ./.github/workflows/_test.yml
     with:
       working-directory: "libs/talon"
-      python-versions: '["3.11", "3.12", "3.13", "3.14"]'
+      python-versions: '["3.12", "3.13", "3.14"]'
       coverage-python-version: "3.12"
 
   test-evals:

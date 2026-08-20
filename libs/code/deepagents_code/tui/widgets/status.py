@@ -11,6 +11,7 @@ from textual.containers import Horizontal, Vertical
 from textual.content import Content
 from textual.css.query import NoMatches
 from textual.reactive import reactive
+from textual.style import Style
 from textual.widget import Widget
 from textual.widgets import Static
 
@@ -44,6 +45,53 @@ CONNECTION_STATES = frozenset(get_args(ConnectionState))
 
 Derived from the `Literal` so the two can never drift."""
 
+PickerTarget = Literal["model", "effort"]
+"""Spans in the model label that open a picker on Ctrl+click.
+
+Each member names both an entry in `_PICKER_ACTIONS` and one in
+`_PICKER_STYLES`, so the two mappings stay keyed by this `Literal`."""
+
+PICKER_TARGETS: frozenset[str] = frozenset(get_args(PickerTarget))
+"""Runtime view of `PickerTarget`, used to keep the picker mappings total.
+
+Derived from the `Literal` so the two can never drift."""
+
+_PICKER_TARGET_META = "status-picker-target"
+"""`Style.meta` key that carries a `PickerTarget` from `render` to mouse events.
+
+Textual round-trips the style under the pointer back on every mouse event, so
+this key is how a click resolves to the span it landed on. The namespace is
+screen-global, hence the `status-` prefix."""
+
+_PICKER_ACTIONS: dict[PickerTarget, str] = {
+    "model": "app.open_model_selector",
+    "effort": "app.open_effort_selector",
+}
+"""App action each target dispatches. Keys must cover `PickerTarget` in full.
+
+Textual resolves these names at dispatch time and only logs when a name is
+missing, so `TestStatusBarPickerActions` asserts they exist on the app."""
+
+_PICKER_STYLES = {
+    target: Style.from_meta({_PICKER_TARGET_META: target}) for target in PICKER_TARGETS
+}
+"""Hit-target style per target, holding only the metadata used for resolution.
+
+Derived from `PickerTarget` so a new member cannot be left without a style."""
+
+_PICKER_READY_STYLE = Style(underline=True)
+"""Added on top of a hit-target style while Ctrl is held over that span.
+
+Carries no metadata of its own, so merging it keeps the target resolvable."""
+
+_LEFT_BUTTON = 1
+"""Textual `MouseEvent.button` value for the left mouse button."""
+
+_SINGLE_CLICK_CHAIN = 1
+"""Textual `Click.chain` count for the first click of a sequence.
+
+Later counts are ignored, so a Ctrl+double-click opens one picker, not two."""
+
 StatusMessageSource = Literal["agent", "hooks"]
 """Owners that may write the shared status-message slot."""
 
@@ -69,11 +117,21 @@ class ModelLabel(Widget):
     participates in the same ladder: the effort suffix is preserved (with the
     model left-truncated to make room) and is only dropped once even the
     left-truncated model plus effort cannot fit.
+
+    Whatever text survives that ladder is also a hit target: Ctrl+click on the
+    model span opens the model selector and on the effort span the reasoning
+    effort picker, via the `_PICKER_ACTIONS` app actions. A span that the ladder
+    dropped is not clickable, because only rendered text carries the metadata.
     """
 
     provider: reactive[str] = reactive("", layout=True)
     model: reactive[str] = reactive("", layout=True)
     effort: reactive[str] = reactive("", layout=True)
+    _ctrl_hint_target: reactive[PickerTarget | None] = reactive(None)
+    """Target under the pointer while Ctrl is held, or `None` when there is none.
+
+    Repaints on change so the underline hint appears; only `on_mouse_move` and
+    `on_leave` write it, because terminals do not report modifier release."""
 
     def _clean_model(self) -> str:
         """Strip the provider's registered prefix so the status bar stays compact.
@@ -105,6 +163,95 @@ class ModelLabel(Widget):
         """
         return f"{text} {self.effort}" if self.effort else text
 
+    def _picker_style(self, target: PickerTarget) -> Style:
+        """Return the hit-target style for `target`.
+
+        Args:
+            target: Picker represented by the styled span.
+
+        Returns:
+            The cached hit-target style, underlined while Ctrl is held over
+                this span. `Style` is frozen, so the cached entry is never
+                mutated.
+        """
+        style = _PICKER_STYLES[target]
+        if self._ctrl_hint_target == target:
+            style += _PICKER_READY_STYLE
+        return style
+
+    @staticmethod
+    def _picker_target(event: events.MouseEvent) -> PickerTarget | None:
+        """Resolve a `PickerTarget` from the style under the pointer.
+
+        Args:
+            event: Mouse event carrying the style under the pointer.
+
+        Returns:
+            Target registered in `_PICKER_ACTIONS`, or `None` when the pointer is
+                outside a target span.
+        """
+        # `Style.meta` is `Mapping[str, Any]` and screen-global, so annotate the
+        # lookup to make the membership check a narrowing the type checker sees.
+        # Test against `_PICKER_ACTIONS`, whose `Literal` keys are what lets the
+        # checker narrow; `PICKER_TARGETS` keeps those keys total.
+        target: str | None = event.style.meta.get(_PICKER_TARGET_META)
+        return target if target in _PICKER_ACTIONS else None
+
+    def _clickable_content(self, model: str, *, effort: str = "") -> Content:
+        """Assemble the model and effort spans as separate picker hit-targets.
+
+        Args:
+            model: Text for the model span, which may carry the provider prefix,
+                a leading ellipsis, or both.
+            effort: Text for the effort span, or `""` on the rungs where the
+                ladder dropped the effort suffix. Must match what the caller
+                measured, since the separator adds a cell.
+
+        Returns:
+            The model span, followed by a space and the effort span when `effort`
+                is set.
+        """
+        model_content = Content.styled(model, self._picker_style("model"))
+        if not effort:
+            return model_content
+        return Content.assemble(
+            model_content,
+            " ",
+            Content.styled(effort, self._picker_style("effort")),
+        )
+
+    async def on_click(self, event: events.Click) -> None:
+        """Open a picker for a Ctrl+left-click on a target span in the status bar.
+
+        Textual synthesizes `Click` for any button and posts one per release, so
+        filter on both: without the button check a Ctrl+right-click would open a
+        picker, and without the chain check a Ctrl+double-click would open two.
+        """
+        target = self._picker_target(event)
+        if not event.ctrl or event.button != _LEFT_BUTTON or target is None:
+            return
+        # Stop every chained click, so a repeat does not bubble to the app
+        # handler that refocuses the chat input behind the picker.
+        event.stop()
+        if event.chain > _SINGLE_CLICK_CHAIN:
+            return
+        await self.run_action(_PICKER_ACTIONS[target])
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        """Underline the hovered target and show a pointer while Ctrl is held.
+
+        Clears both otherwise. Terminals do not report modifier release, so the
+        hint goes stale until the next move if Ctrl is released in place.
+        """
+        target = self._picker_target(event) if event.ctrl else None
+        self._ctrl_hint_target = target
+        self.styles.pointer = "pointer" if target is not None else "default"
+
+    def on_leave(self) -> None:
+        """Clear the underline and the pointer when the pointer leaves the label."""
+        self._ctrl_hint_target = None
+        self.styles.pointer = "default"
+
     def get_content_width(self, container: Size, viewport: Size) -> int:  # noqa: ARG002
         """Return the intrinsic width so `width: auto` works.
 
@@ -125,7 +272,9 @@ class ModelLabel(Widget):
         """Render the model label with width-aware truncation.
 
         Returns:
-            Text content, truncated from the left when necessary.
+            Text content, truncated from the left when necessary. Each rendered
+                span carries its `PickerTarget` metadata, so a rung that drops
+                the effort suffix leaves no effort target to click.
         """
         width = self.content_size.width
         if not self.model or width <= 0:
@@ -135,18 +284,19 @@ class ModelLabel(Widget):
         full_with_effort = self._with_effort(full)
         model_with_effort = self._with_effort(model)
         if len(full_with_effort) <= width:
-            return Content(full_with_effort)
+            return self._clickable_content(full, effort=self.effort)
         if len(model_with_effort) <= width:
-            return Content(model_with_effort)
+            return self._clickable_content(model, effort=self.effort)
         suffix = f" {self.effort}" if self.effort else ""
         if suffix and width > len(suffix) + 1:
             model_width = width - len(suffix)
-            return Content(f"\u2026{model[-(model_width - 1) :]}{suffix}")
+            truncated_model = f"\u2026{model[-(model_width - 1) :]}"
+            return self._clickable_content(truncated_model, effort=self.effort)
         if len(model) <= width:
-            return Content(model)
+            return self._clickable_content(model)
         if width > 1:
-            return Content("\u2026" + model[-(width - 1) :])
-        return Content("\u2026")
+            return self._clickable_content("\u2026" + model[-(width - 1) :])
+        return self._clickable_content("\u2026")
 
 
 class BranchLabel(Widget):
@@ -250,8 +400,8 @@ class MetricsLine(Widget):
         ellipsis = get_glyphs().ellipsis
         if width <= len(ellipsis):
             return Content("")
-        first = self._chain(1).plain
-        return Content(first[: width - len(ellipsis)] + ellipsis)
+        first = self._chain(1).truncate(width - len(ellipsis))
+        return first + ellipsis
 
 
 class StatusBar(Vertical):
@@ -851,20 +1001,29 @@ class StatusBar(Vertical):
         Returns:
             Styled cache usage.
         """
-        hit_rate = ""
+        colors = theme.get_theme_colors(self)
+        hit_rate = Content("")
         if self.cache_input_tokens:
             cached = min(self.cache_read_tokens, self.cache_input_tokens)
-            hit_rate = f"{cached / self.cache_input_tokens * 100:.0f}% hit"
+            percent = cached / self.cache_input_tokens * 100
+            if percent < 60.0:  # noqa: PLR2004  # cache alert threshold
+                color = colors.error
+            elif percent < 90.0:  # noqa: PLR2004  # cache warning threshold
+                color = colors.warning
+            else:
+                color = colors.muted
+            hit_rate = Content.styled(f"{percent:.0f}% hit", color)
         elif not self.cache_read_tokens and not self.cache_write_tokens:
-            hit_rate = "0% hit"
+            return Content("")
         details = (
             f"{_compact_tokens(self.cache_read_tokens)} read"
             f" / {_compact_tokens(self.cache_write_tokens)} write"
         )
         return Content.assemble(
-            Content.styled("Cache", theme.get_theme_colors(self).muted),
+            Content.styled("Cache", colors.muted),
             " ",
-            f"{hit_rate} {get_glyphs().bullet} " if hit_rate else "",
+            hit_rate,
+            f" {get_glyphs().bullet} " if hit_rate.plain else "",
             details,
         )
 

@@ -357,12 +357,23 @@ def _invoke_interactive(
         text=True,
     )
     os.close(secondary)
-    for line in answers:
-        payload = b"\x04" if line is _CTRL_D else f"{line}\n".encode()
-        os.write(primary, payload)
-    output = proc.stdout.read() if proc.stdout else ""
-    proc.wait(timeout=30)
-    os.close(primary)
+    try:
+        for line in answers:
+            payload = b"\x04" if line is _CTRL_D else f"{line}\n".encode()
+            os.write(primary, payload)
+        assert proc.stdout is not None
+        output = proc.stdout.read()
+        proc.wait(timeout=30)
+    finally:
+        # A `TimeoutExpired` here would otherwise leak the pipe and the pty and
+        # orphan the child — precisely when a cascade of unraisable warnings
+        # would obscure the real failure.
+        if proc.stdout is not None:
+            proc.stdout.close()
+        os.close(primary)
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
     clean = re.sub(r"\x1b\[[0-9;]*m", "", output)
     return proc.returncode, clean, tmp_path / "uv-args.txt"
 
@@ -5345,10 +5356,20 @@ def _invoke_with_local_dcode_not_on_path(
             text=True,
         )
         os.close(secondary)
-        os.write(primary, f"{answer}\n".encode())
-        output = proc.stdout.read() if proc.stdout else ""
-        proc.wait(timeout=30)
-        os.close(primary)
+        try:
+            os.write(primary, f"{answer}\n".encode())
+            assert proc.stdout is not None
+            output = proc.stdout.read()
+            proc.wait(timeout=30)
+        finally:
+            # See `_invoke_interactive`: the timeout path must not leak the
+            # pipe and pty or orphan the child.
+            if proc.stdout is not None:
+                proc.stdout.close()
+            os.close(primary)
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
         clean = re.sub(r"\x1b\[[0-9;]*m", "", output)
         return subprocess.CompletedProcess(
             args=["bash", str(SCRIPT)],
@@ -5446,7 +5467,11 @@ def test_install_script_emits_reload_hint_after_writing_a_profile(
     assert proc.returncode == 0, proc.stderr
     combined = proc.stdout + proc.stderr
     assert "Added ~/.local/bin to PATH" in combined
-    assert "Restart your shell, or run:" in combined
+    # The profile write succeeded, so the hint is a next step, not a warning:
+    # the running shell is stale but new terminals already work.
+    assert "To use dcode in this shell, run:" in combined
+    assert "Restart your shell, or run:" not in combined
+    assert 'export PATH="$HOME/.local/bin:$PATH"' in combined
 
 
 def test_install_script_tilde_display_has_no_literal_backslash(
@@ -6108,9 +6133,10 @@ def test_install_script_stale_shell_with_profile_already_set_shows_reload_hint(
     combined = proc.stdout + proc.stderr
     # No duplicate PATH export was appended.
     assert combined.count('export PATH="$HOME/.local/bin:$PATH"') == 1
-    # But the reload hint is shown because the current shell is stale.
-    assert "Restart your shell, or run:" in combined
-    assert 'export PATH="$HOME/.local/bin:$PATH"' in combined
+    # But the reload hint is shown because the current shell is stale — styled
+    # as a next step, not a warning, since no setup step failed.
+    assert "To use dcode in this shell, run:" in combined
+    assert "Restart your shell, or run:" not in combined
 
 
 def test_install_script_rewrites_existing_managed_path_block(tmp_path: Path) -> None:
